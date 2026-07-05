@@ -24,6 +24,22 @@ import {
   signOut as firebaseSignOut,
   updateProfile,
 } from "firebase/auth";
+import {
+  getFirestore,
+  collection,
+  addDoc,
+  updateDoc,
+  deleteDoc,
+  doc,
+  onSnapshot,
+  query,
+  where,
+  orderBy,
+  serverTimestamp,
+  getDoc,
+  setDoc,
+} from "firebase/firestore";
+import { getFunctions, httpsCallable } from "firebase/functions";
 
 const firebaseConfig = {
   apiKey: "AIzaSyAHUzE59H3P43F-Yp1VyNM_E5lAwpn9OVg",
@@ -36,8 +52,73 @@ const firebaseConfig = {
 
 // Prevent duplicate app initialisation (React hot-reload safe)
 const firebaseApp = getApps().length ? getApps()[0] : initializeApp(firebaseConfig);
-const auth = getAuth(firebaseApp);
+const auth          = getAuth(firebaseApp);
+const db            = getFirestore(firebaseApp);
+const functions     = getFunctions(firebaseApp, "asia-south1");
 const googleProvider = new GoogleAuthProvider();
+
+// ── Cloud Function callables ───────────────────────────────────
+const _createBooking       = httpsCallable(functions, "createBooking");
+const _updateBookingStatus = httpsCallable(functions, "updateBookingStatus");
+const _assignProfessional  = httpsCallable(functions, "assignProfessional");
+const _generateInvoice     = httpsCallable(functions, "generateInvoice");
+
+// ── Firestore helpers ──────────────────────────────────────────
+async function fsCreateBooking(data) {
+  const res = await _createBooking(data);
+  return res.data;
+}
+async function fsUpdateStatus(docId, status) {
+  const res = await _updateBookingStatus({ docId, status });
+  return res.data;
+}
+async function fsAssignPro(docId, proName, proPhone, proEmail) {
+  const res = await _assignProfessional({ docId, proName, proPhone: proPhone||"", proEmail: proEmail||"" });
+  return res.data;
+}
+async function fsGenerateInvoice(docId) {
+  const res = await _generateInvoice({ docId });
+  return res.data;
+}
+
+// Real-time bookings listener — returns unsubscribe fn
+function subscribeBookings(scope, uid, onData) {
+  let q;
+  if (scope === "all") {
+    q = query(collection(db, "bookings"), orderBy("createdAt", "desc"));
+  } else {
+    q = query(collection(db, "bookings"), where("customerId", "==", uid), orderBy("createdAt", "desc"));
+  }
+  return onSnapshot(q, snap => {
+    onData(snap.docs.map(d => ({ ...d.data(), docId: d.id })));
+  }, err => console.error("subscribeBookings:", err));
+}
+
+// Real-time KYC listener
+function subscribeKyc(onData) {
+  return onSnapshot(collection(db, "kyc_queue"), snap => {
+    onData(snap.docs.map(d => ({ ...d.data(), docId: d.id })));
+  }, err => console.error("subscribeKyc:", err));
+}
+
+// Real-time professionals listener
+function subscribeProfessionals(onData) {
+  return onSnapshot(collection(db, "professionals"), snap => {
+    onData(snap.docs.map(d => ({ ...d.data(), docId: d.id })));
+  }, err => console.error("subscribeProfessionals:", err));
+}
+
+// Sync services to Firestore (admin pricing save)
+async function fsSaveServices(servicesArr) {
+  await Promise.all(servicesArr.map(s =>
+    setDoc(doc(db, "services", s.id), { ...s, updatedAt: serverTimestamp() }, { merge: true })
+  ));
+}
+
+// Sync visit charges to Firestore
+async function fsSaveVisitCharges(charges) {
+  await setDoc(doc(db, "visit_charges", "default"), { ...charges, updatedAt: serverTimestamp() }, { merge: true });
+}
 
 /* ============================================================
    CONSTANTS & DATA
@@ -628,25 +709,52 @@ function BookingPage({ services, visitCharges, currentUser, onNeedAuth, showToas
   const visitCharge = visitCharges[form.city] || 0;
   const today = new Date().toISOString().split("T")[0];
 
-  function submit() {
+  const [submitting, setSubmitting] = useState(false);
+
+  async function submit() {
     if (!currentUser) { onNeedAuth(); showToast("Please sign in before booking.", "warn"); return; }
     if (!form.name || !form.phone || !form.service || !form.address || !form.city || !form.date) {
       showToast("Please fill all required fields.", "error"); return;
     }
-    const booking = {
-      id: "#" + String(1000 + bookings.length + 1),
-      uid: currentUser.uid,
-      name: form.name, phone: form.phone, email: form.email,
-      service: svc ? svc.name : form.service, serviceId: form.service,
-      address: form.address, city: form.city, date: form.date, time: form.time,
-      notes: form.notes, status: "Pending", assignedPro: "",
-      visitCharge, createdAt: new Date().toISOString(),
-    };
-    const updated = [...bookings, booking];
-    setBookings(updated);
-    saveData(KEYS.bookings, updated);
-    setDone(true);
-    showToast("Booking confirmed! We'll call you shortly.", "success");
+    setSubmitting(true);
+    try {
+      // ── Save to Firestore via Cloud Function ──
+      await fsCreateBooking({
+        customerId:   currentUser.uid,
+        customerName: form.name.trim(),
+        phone:        form.phone.trim(),
+        email:        form.email.trim().toLowerCase(),
+        service:      svc ? svc.name : form.service,
+        serviceId:    form.service,
+        address:      form.address.trim(),
+        city:         form.city,
+        date:         form.date,
+        time:         form.time,
+        notes:        form.notes.trim(),
+        visitCharge,
+      });
+      setDone(true);
+      showToast("Booking confirmed! Confirmation email sent.", "success");
+    } catch (err) {
+      console.error("Booking failed:", err);
+      // Fallback: save to localStorage if Cloud Function fails
+      const booking = {
+        id: "#" + String(1000 + bookings.length + 1),
+        uid: currentUser.uid,
+        name: form.name, phone: form.phone, email: form.email,
+        service: svc ? svc.name : form.service, serviceId: form.service,
+        address: form.address, city: form.city, date: form.date, time: form.time,
+        notes: form.notes, status: "Pending", assignedPro: "",
+        visitCharge, createdAt: new Date().toISOString(),
+      };
+      const updated = [...bookings, booking];
+      setBookings(updated);
+      saveData(KEYS.bookings, updated);
+      setDone(true);
+      showToast("Booking saved! (offline mode)", "warn");
+    } finally {
+      setSubmitting(false);
+    }
   }
 
   if (done) return (
@@ -807,7 +915,7 @@ function AdminDashboard({ bookings, professionals, kycQueue, setAdminPanel, onQu
           <div className="card-header"><h3>Pending Onboarding</h3><button className="btn btn-ghost btn-sm" onClick={() => setAdminPanel("onboarding")}>Review all</button></div>
           <div style={{ overflowX: "auto" }}>
             <table className="tbl"><thead><tr><th>Name</th><th>Service</th><th>KYC</th><th>Action</th></tr></thead>
-              <tbody>{kycQueue.slice(0, 4).map(k => <tr key={k.id}><td>{k.name}</td><td>{k.service}</td><td><Badge status={k.kyc} /></td><td><button className="btn btn-success btn-sm" onClick={() => onQuickApprove(k.id)}>Approve</button></td></tr>)}{!kycQueue.length && <tr><td colSpan={4} style={{ textAlign: "center", color: COLORS.hint, padding: 20 }}>None pending</td></tr>}</tbody>
+              <tbody>{kycQueue.filter(x=>x.kyc==="Pending").slice(0, 4).map(k => <tr key={k.docId||k.id}><td>{k.name}</td><td>{k.service}</td><td><Badge status={k.kyc} /></td><td><button className="btn btn-success btn-sm" onClick={() => onQuickApprove(k)}>Approve</button></td></tr>)}{!kycQueue.filter(x=>x.kyc==="Pending").length && <tr><td colSpan={4} style={{ textAlign: "center", color: COLORS.hint, padding: 20 }}>None pending</td></tr>}</tbody>
             </table>
           </div>
         </div>
@@ -840,26 +948,58 @@ function AdminOnboarding({ kycQueue, setKycQueue, professionals, setProfessional
     let v = e.target.value.replace(/\D/g, "").substring(0, 12).replace(/(.{4})(.{0,4})(.{0,4})/, "$1 $2 $3").trim();
     setForm(p => ({ ...p, aadhar: v }));
   }
-  function submit() {
+  async function submit() {
     if (!form.name || !form.phone || !form.email || !form.dob || !form.aadhar || !form.pan || !form.svc) { showToast("Please fill all required fields.", "error"); return; }
     if (form.aadhar.replace(/\s/g, "").length < 12) { showToast("Enter a valid 12-digit Aadhaar number.", "error"); return; }
     if (!/^[A-Z]{5}[0-9]{4}[A-Z]$/.test(form.pan.toUpperCase())) { showToast("Enter a valid PAN number (e.g. ABCDE1234F).", "error"); return; }
-    const entry = { id: "k" + Date.now(), name: form.name, initials: getInitials(form.name), service: form.svc, city: form.city, phone: form.phone, dob: form.dob, aadhar: form.aadhar, pan: form.pan.toUpperCase(), email: form.email, kyc: "Pending", submitted: new Date().toLocaleDateString("en-IN", { day: "numeric", month: "short", year: "numeric" }) };
-    const updated = [...kycQueue, entry]; setKycQueue(updated); saveData(KEYS.kyc, updated);
+    const entry = { name: form.name, initials: getInitials(form.name), service: form.svc, city: form.city, phone: form.phone, dob: form.dob, aadhar: form.aadhar, pan: form.pan.toUpperCase(), email: form.email, kyc: "Pending", submitted: new Date().toLocaleDateString("en-IN", { day: "numeric", month: "short", year: "numeric" }), createdAt: serverTimestamp() };
+    try {
+      // Save to Firestore
+      const docRef = await addDoc(collection(db, "kyc_queue"), entry);
+      showToast(`${form.name} submitted for KYC review.`, "success");
+    } catch (err) {
+      console.error("KYC Firestore save failed:", err);
+      // Fallback: localStorage
+      const fallback = { ...entry, id: "k" + Date.now(), createdAt: new Date().toISOString() };
+      const updated = [...kycQueue, fallback]; setKycQueue(updated); saveData(KEYS.kyc, updated);
+      showToast(`${form.name} submitted (offline mode).`, "warn");
+    }
     setForm({ name: "", phone: "", email: "", dob: "", aadhar: "", pan: "", svc: "", exp: "", city: CITIES[0], addr: "" });
-    showToast(`${form.name} submitted for KYC review.`, "success"); setTab("review");
+    setTab("review");
   }
-  function approve(id) {
-    const k = kycQueue.find(x => x.id === id); if (!k) return;
-    const newPro = { id: Date.now(), name: k.name, initials: k.initials, service: k.service, city: k.city, phone: k.phone, dob: k.dob, aadhar: k.aadhar, pan: k.pan, email: k.email, rating: 5.0, jobs: 0, kyc: "Verified", status: "Active", exp: 0 };
-    const updatedPros = [...professionals, newPro]; const updatedKyc = kycQueue.filter(x => x.id !== id);
-    setProfessionals(updatedPros); setKycQueue(updatedKyc); saveData(KEYS.pros, updatedPros); saveData(KEYS.kyc, updatedKyc);
-    showToast(`${k.name} approved and now live!`, "success");
+  async function approve(k) {
+    const id = k.docId || k.id;
+    if (!k) return;
+    const newPro = { name: k.name, initials: k.initials, service: k.service, city: k.city, phone: k.phone, dob: k.dob || "", aadhar: k.aadhar, pan: k.pan, email: k.email, rating: 5.0, jobs: 0, kyc: "Verified", status: "Active", exp: 0, approvedAt: serverTimestamp() };
+    try {
+      // Add to professionals collection + delete from kyc_queue
+      await addDoc(collection(db, "professionals"), newPro);
+      if (k.docId) await deleteDoc(doc(db, "kyc_queue", k.docId));
+      showToast(`${k.name} approved and now live!`, "success");
+    } catch (err) {
+      console.error("Approve KYC error:", err);
+      // Fallback localStorage
+      const updatedPros = [...professionals, { ...newPro, id: Date.now() }];
+      const updatedKyc = kycQueue.filter(x => (x.docId||x.id) !== id);
+      setProfessionals(updatedPros); setKycQueue(updatedKyc);
+      saveData(KEYS.pros, updatedPros); saveData(KEYS.kyc, updatedKyc);
+      showToast(`${k.name} approved (offline mode).`, "warn");
+    }
   }
-  function reject(id) {
-    const k = kycQueue.find(x => x.id === id);
-    const updated = kycQueue.filter(x => x.id !== id); setKycQueue(updated); saveData(KEYS.kyc, updated);
-    showToast(`${k?.name}'s application rejected.`, "warn");
+  async function reject(k) {
+    const id = k.docId || k.id;
+    try {
+      if (k.docId) {
+        // Mark as rejected in Firestore instead of deleting (audit trail)
+        await updateDoc(doc(db, "kyc_queue", k.docId), { kyc: "Rejected", rejectedAt: serverTimestamp() });
+      }
+      showToast(`${k.name}'s application rejected.`, "warn");
+    } catch (err) {
+      console.error("Reject KYC error:", err);
+      const updated = kycQueue.filter(x => (x.docId||x.id) !== id);
+      setKycQueue(updated); saveData(KEYS.kyc, updated);
+      showToast(`${k?.name}'s application rejected (offline).`, "warn");
+    }
   }
   return (
     <div>
@@ -912,8 +1052,8 @@ function AdminOnboarding({ kycQueue, setKycQueue, professionals, setProfessional
         <div>
           {!kycQueue.length
             ? <div className="notif-success-banner">✓ All professionals have been reviewed.</div>
-            : kycQueue.map(k => (
-              <div key={k.id} className="pro-card">
+            : kycQueue.filter(x => x.kyc === "Pending").map(k => (
+              <div key={k.docId||k.id} className="pro-card">
                 <div className="avatar avatar-md avatar-pr">{k.initials}</div>
                 <div style={{ flex: 1 }}>
                   <h4 style={{ fontSize: 14, fontWeight: 700, marginBottom: 2 }}>{k.name} <Badge status={k.kyc} /></h4>
@@ -921,8 +1061,8 @@ function AdminOnboarding({ kycQueue, setKycQueue, professionals, setProfessional
                   <p style={{ fontSize: 11, color: COLORS.hint, marginTop: 4 }}>Aadhaar: {k.aadhar} | PAN: {k.pan} | Submitted: {k.submitted}</p>
                 </div>
                 <div style={{ display: "flex", gap: 6 }}>
-                  <button className="btn btn-success btn-sm" onClick={() => approve(k.id)}>✓ Approve</button>
-                  <button className="btn btn-danger btn-sm" onClick={() => reject(k.id)}>✕ Reject</button>
+                  <button className="btn btn-success btn-sm" onClick={() => approve(k)}>✓ Approve</button>
+                  <button className="btn btn-danger btn-sm" onClick={() => reject(k)}>✕ Reject</button>
                 </div>
               </div>
             ))}
@@ -1054,8 +1194,9 @@ function AdminPricing({ services, setServices, showToast }) {
 function AdminVisitCharges({ visitCharges, setVisitCharges, showToast }) {
   const [charges, setCharges] = useState(visitCharges);
   const [saved, setSaved] = useState(false);
-  function save() {
+  async function save() {
     setVisitCharges(charges); saveData(KEYS.visits, charges);
+    try { await fsSaveVisitCharges(charges); } catch (e) { console.warn("Firestore visit charges sync failed:", e); }
     setSaved(true); setTimeout(() => setSaved(false), 3500); showToast("Visit charges saved.", "success");
   }
   const cityMeta = { "Delhi NCR": ["🏙️","#FFF0E8"], Mumbai: ["🌊","#E8F0FF"], Bangalore: ["🌿","#E8F5EF"], Hyderabad: ["⭐","#FFFBE8"] };
@@ -1102,15 +1243,45 @@ function AdminVisitCharges({ visitCharges, setVisitCharges, showToast }) {
 function AdminBookings({ bookings, setBookings, professionals, showToast }) {
   const [statusFilter, setStatusFilter] = useState(""); const [viewIdx, setViewIdx] = useState(null);
   const activePros = professionals.filter(p => p.status === "Active");
-  let list = (statusFilter ? bookings.filter(b => b.status === statusFilter) : bookings).slice().reverse();
+  const list = (statusFilter ? bookings.filter(b => b.status === statusFilter) : bookings).slice().reverse();
 
-  function assignPro(origIdx, name) {
-    const updated = bookings.map((b, i) => i === origIdx ? { ...b, assignedPro: name, status: name && b.status === "Pending" ? "Confirmed" : b.status } : b);
-    setBookings(updated); saveData(KEYS.bookings, updated); if (name) showToast(`${name} assigned.`, "success");
+  async function assignPro(b, proName) {
+    if (!proName) return;
+    // Find the pro object so we can pass phone/email too
+    const pro = professionals.find(p => p.name === proName);
+    try {
+      if (b.docId) {
+        await fsAssignPro(b.docId, proName, pro?.phone || "", pro?.email || "");
+        showToast(`${proName} assigned. Customer notified by email.`, "success");
+      } else {
+        // Fallback for localStorage bookings
+        const idx = bookings.findIndex(x => x.id === b.id);
+        const updated = bookings.map((bk, i) => i === idx ? { ...bk, assignedPro: proName, status: "Confirmed" } : bk);
+        setBookings(updated); saveData(KEYS.bookings, updated);
+        showToast(`${proName} assigned.`, "success");
+      }
+    } catch (err) {
+      console.error("assignPro error:", err);
+      showToast("Failed to assign. Please try again.", "error");
+    }
   }
-  function updateStatus(origIdx, status) {
-    const updated = bookings.map((b, i) => i === origIdx ? { ...b, status } : b);
-    setBookings(updated); saveData(KEYS.bookings, updated); showToast(`Booking marked as ${status}.`, "success"); setViewIdx(null);
+  async function updateStatus(b, status) {
+    try {
+      if (b.docId) {
+        await fsUpdateStatus(b.docId, status);
+        showToast(`Booking marked as ${status}. Customer notified.`, "success");
+        if (status === "Completed") showToast("Invoice being generated and emailed to customer…", "success");
+      } else {
+        const idx = bookings.findIndex(x => x.id === b.id);
+        const updated = bookings.map((bk, i) => i === idx ? { ...bk, status } : bk);
+        setBookings(updated); saveData(KEYS.bookings, updated);
+        showToast(`Booking marked as ${status}.`, "success");
+      }
+    } catch (err) {
+      console.error("updateStatus error:", err);
+      showToast("Failed to update status. Please try again.", "error");
+    }
+    setViewIdx(null);
   }
   function exportCSV() {
     const headers = ["ID","Customer","Phone","Email","Service","Date","Time","City","Visit ₹","Status"];
@@ -1137,7 +1308,6 @@ function AdminBookings({ bookings, setBookings, professionals, showToast }) {
             <thead><tr><th>#</th><th>Customer</th><th>Service</th><th>Date & Time</th><th>City</th><th>Visit ₹</th><th>Assign Pro</th><th>Status</th><th>Action</th></tr></thead>
             <tbody>
               {list.length ? list.map((b, ri) => {
-                const origIdx = bookings.length - 1 - ri;
                 return (
                   <tr key={b.id}>
                     <td style={{ fontWeight: 700, color: COLORS.pr }}>{b.id}</td>
@@ -1146,14 +1316,14 @@ function AdminBookings({ bookings, setBookings, professionals, showToast }) {
                     <td>{b.date}<div style={{ fontSize: 11, color: COLORS.muted }}>{b.time}</div></td>
                     <td>{b.city}</td><td style={{ fontWeight: 700 }}>₹{b.visitCharge}</td>
                     <td>
-                      <select style={{ border: `1.5px solid ${COLORS.bdr}`, borderRadius: 8, padding: "5px 8px", fontFamily: "Nunito,sans-serif", fontSize: 12, fontWeight: 600, background: "#fff", outline: "none", cursor: "pointer" }} value={b.assignedPro || ""} onChange={e => assignPro(origIdx, e.target.value)}>
+                      <select style={{ border: `1.5px solid ${COLORS.bdr}`, borderRadius: 8, padding: "5px 8px", fontFamily: "Nunito,sans-serif", fontSize: 12, fontWeight: 600, background: "#fff", outline: "none", cursor: "pointer" }} value={b.assignedPro || ""} onChange={e => assignPro(b, e.target.value)}>
                         <option value="">Unassigned</option>{activePros.map(p => <option key={p.id} value={p.name}>{p.name}</option>)}
                       </select>
                     </td>
                     <td><Badge status={b.status} /></td>
                     <td><div style={{ display: "flex", gap: 4 }}>
-                      <button className="btn btn-ghost btn-sm" onClick={() => setViewIdx(origIdx)}>👁</button>
-                      {b.status === "Pending" && <button className="btn btn-success btn-sm" onClick={() => updateStatus(origIdx, "Confirmed")}>✓</button>}
+                      <button className="btn btn-ghost btn-sm" onClick={() => setViewIdx(ri)}>👁</button>
+                      {b.status === "Pending" && <button className="btn btn-success btn-sm" onClick={() => updateStatus(b, "Confirmed")}>✓</button>}
                     </div></td>
                   </tr>
                 );
@@ -1180,8 +1350,8 @@ function AdminBookings({ bookings, setBookings, professionals, showToast }) {
             </div>
             <div className="modal-footer">
               <button className="btn btn-ghost" onClick={() => setViewIdx(null)}>Close</button>
-              <button className="btn btn-danger btn-sm" onClick={() => updateStatus(viewIdx, "Cancelled")}>Cancel Booking</button>
-              <button className="btn btn-primary" onClick={() => updateStatus(viewIdx, "Completed")}>Mark Completed</button>
+              <button className="btn btn-danger btn-sm" onClick={() => updateStatus(vb, "Cancelled")}>Cancel Booking</button>
+              <button className="btn btn-primary" onClick={() => updateStatus(vb, "Completed")}>Mark Completed</button>
             </div>
           </div>
         </div>
@@ -1261,12 +1431,20 @@ function AdminShell({ adminUser, onClose, bookings, setBookings, professionals, 
   ];
   const titles = { dashboard: "Dashboard", onboarding: "Professional Onboarding", professionals: "All Professionals", pricing: "Service Price Management", visit: "Visit Charges", bookings: "Bookings", analytics: "Analytics" };
 
-  function quickApprove(id) {
-    const k = kycQueue.find(x => x.id === id); if (!k) return;
-    const newPro = { id: Date.now(), name: k.name, initials: k.initials, service: k.service, city: k.city, phone: k.phone, email: k.email, rating: 5.0, jobs: 0, kyc: "Verified", status: "Active", exp: 0 };
-    const updPros = [...professionals, newPro]; const updKyc = kycQueue.filter(x => x.id !== id);
-    setProfessionals(updPros); setKycQueue(updKyc); saveData(KEYS.pros, updPros); saveData(KEYS.kyc, updKyc);
-    showToast(`${k.name} approved and now live!`, "success");
+  async function quickApprove(k) {
+    if (!k) return;
+    const newPro = { name: k.name, initials: k.initials||"", service: k.service, city: k.city, phone: k.phone, dob: k.dob||"", aadhar: k.aadhar||"", pan: k.pan||"", email: k.email, rating: 5.0, jobs: 0, kyc: "Verified", status: "Active", exp: 0, approvedAt: serverTimestamp() };
+    try {
+      await addDoc(collection(db, "professionals"), newPro);
+      if (k.docId) await deleteDoc(doc(db, "kyc_queue", k.docId));
+      showToast(`${k.name} approved and live!`, "success");
+    } catch (err) {
+      const updPros = [...professionals, { ...newPro, id: Date.now() }];
+      const updKyc  = kycQueue.filter(x => (x.docId||x.id) !== (k.docId||k.id));
+      setProfessionals(updPros); setKycQueue(updKyc);
+      saveData(KEYS.pros, updPros); saveData(KEYS.kyc, updKyc);
+      showToast(`${k.name} approved (offline).`, "warn");
+    }
   }
 
   return (
@@ -1528,9 +1706,7 @@ export default function App() {
   // Listen to Firebase auth state changes (for regular site users)
   useEffect(() => {
     const unsub = onAuthStateChanged(auth, user => {
-      // If the signed-in user is the admin, don't treat them as a site user
       if (user && user.email?.toLowerCase() === ADMIN_EMAIL.toLowerCase()) {
-        // Keep currentUser null for site — admin is tracked separately
         setCurrentUser(null);
       } else {
         setCurrentUser(user);
@@ -1538,6 +1714,30 @@ export default function App() {
       setAuthReady(true);
     });
     return unsub;
+  }, []);
+
+  // ── Real-time Firestore listeners (always on) ─────────────
+  useEffect(() => {
+    // Bookings — all (for admin) and own (for customer)
+    const unsubBookings = subscribeBookings("all", null, (docs) => {
+      if (docs.length > 0) setBookings(docs);
+    });
+
+    // KYC queue
+    const unsubKyc = subscribeKyc((docs) => {
+      if (docs.length > 0) setKycQueue(docs);
+    });
+
+    // Professionals
+    const unsubPros = subscribeProfessionals((docs) => {
+      if (docs.length > 0) setProfessionals(docs);
+    });
+
+    return () => {
+      unsubBookings();
+      unsubKyc();
+      unsubPros();
+    };
   }, []);
 
   const showToast = useCallback((msg, type = "success") => {
